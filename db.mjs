@@ -248,6 +248,19 @@ class PostgresDB {
 
   async init(pg) {
     this.pool = new pg.Pool({ connectionString: this.connectionString });
+    // An idle client whose connection drops (database restart, password change, network
+    // blip) emits "error" on the pool. With no listener Node treats it as an unhandled
+    // error and the process exits. The pool already discards the broken client and opens a
+    // new one on the next query, so logging is all that is needed. Code only: the message
+    // can carry connection details.
+    this.pool.on("error", (err) => {
+      let label = "unknown";
+      try {
+        const raw = err && (err.code || err.name);
+        if (typeof raw === "string" && /^[A-Za-z0-9_]{1,40}$/.test(raw)) label = raw;
+      } catch { /* an odd error object must not take the process down either */ }
+      console.error(`[DB] idle client error (${label}); pool will reconnect on the next query`);
+    });
     await this.pool.query(SCHEMA_SQL);
     await this.pool.query(INDEX_SQL);
     await this.pool.query(SEED_SQL);

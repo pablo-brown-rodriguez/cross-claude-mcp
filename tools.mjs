@@ -36,7 +36,10 @@ export function registerTools(server, db, planChecker = null) {
 
   function touchHeartbeat() {
     if (!currentInstanceId) return;
-    try { db.heartbeat(currentInstanceId); } catch { /* ignore */ }
+    // heartbeat() is async on PostgreSQL: a rejected promise is not caught by try/catch, and an
+    // unhandled rejection ends the process (Node 15+). A missed heartbeat is harmless, so the
+    // rejection is swallowed here; the tool call itself still reports its own database error.
+    try { Promise.resolve(db.heartbeat(currentInstanceId)).catch(() => {}); } catch { /* ignore */ }
   }
 
   server.tool(

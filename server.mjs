@@ -102,6 +102,13 @@ li{margin:4px 0}</style></head>
   // --- Bearer token auth ---
 
   const API_TOKEN = process.env.MCP_API_KEY;
+  const { createHash, timingSafeEqual } = await import("crypto");
+  const sha256 = (value) => createHash("sha256").update(String(value), "utf8").digest();
+  // Constant-time comparison on fixed-length digests; the candidate is never logged.
+  const tokenMatches = (candidate) =>
+    typeof candidate === "string" && candidate.length > 0 &&
+    timingSafeEqual(sha256(candidate), sha256(API_TOKEN));
+
   app.use((req, res, next) => {
     if (req.path === "/health" || req.path === "/readme" || req.path.startsWith("/openapi.json")) return next();
 
@@ -109,8 +116,10 @@ li{margin:4px 0}</style></head>
       const authHeader = req.headers.authorization || "";
       const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7)
         : req.query.api_key || null;
-      if (!token || token !== API_TOKEN) {
-        console.log(`[AUTH FAIL] ${req.method} ${req.path} | auth header: "${authHeader.slice(0, 20)}..." | query api_key: ${req.query.api_key ? "present" : "absent"}`);
+      if (!tokenMatches(token)) {
+        // Log only whether credentials were sent, never any part of them: a failed
+        // sign-in often carries a real key with a typo, or last month's key.
+        console.log(`[AUTH FAIL] ${req.method} ${req.path} | authorization header: ${authHeader ? "present" : "absent"} | query api_key: ${req.query.api_key ? "present" : "absent"}`);
         return res.status(401).json({ error: "Unauthorized" });
       }
     }
