@@ -12,6 +12,17 @@ import { Router } from "express";
 import { STALE_THRESHOLD_SECONDS } from "./tools.mjs";
 import { normalizeChannelName } from "./db.mjs";
 
+// A path for a log line: its first two segments only. Channel names, shared-data keys and
+// message ids sit deeper in REST paths and stay out of the log.
+export function logPath(path) {
+  let text = String(path || "");
+  try { text = decodeURIComponent(text); } catch { /* malformed escape: split it as sent */ }
+  // Decoding can produce line breaks and other control characters: only printable ASCII may
+  // reach a log line, where a line break would let a caller write a second, made-up line.
+  const parts = text.replace(/[^\x20-\x7e]/g, "?").split("/").filter(Boolean);
+  return "/" + parts.slice(0, 2).map((p) => p.slice(0, 40)).join("/") + (parts.length > 2 ? "/..." : "");
+}
+
 /**
  * @param {object} db - Database instance (SqliteDB or PostgresDB)
  * @returns {Router}
@@ -19,8 +30,8 @@ import { normalizeChannelName } from "./db.mjs";
 export function createRestRouter(db) {
   const router = Router();
   router.use((req, res, next) => {
-    // express.json() should already be applied, but ensure it
-    if (req.is("application/json") && !req.body) {
+    // A POST with no JSON body reached the handlers as undefined and failed as a 500.
+    if (req.method === "POST" && (req.body === null || typeof req.body !== "object")) {
       return res.status(400).json({ error: "Request body must be JSON" });
     }
     next();
@@ -168,7 +179,10 @@ export function createRestRouter(db) {
   // --- Error handler ---
 
   router.use((err, req, res, _next) => {
-    console.error("REST API error:", err);
+    // Kind and place only; the whole error object carried the message and a full stack.
+    const name = err && typeof err.name === "string" ? err.name : "Error";
+    const code = err && (typeof err.code === "string" || typeof err.code === "number") ? ` ${err.code}` : "";
+    console.error(`[ERROR] REST ${req.method} ${logPath(req.baseUrl + req.path)} | ${`${name}${code}`.replace(/[^\w .:-]/g, "").slice(0, 80)}`);
     res.status(500).json({ error: "Internal server error" });
   });
 
