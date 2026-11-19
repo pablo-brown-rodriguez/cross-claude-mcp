@@ -40,7 +40,7 @@ For a single machine with multiple Claude Code terminals. No setup beyond clonin
 
 For teams, cross-machine collaboration, or cross-model communication. Deploy to Railway (or any hosting) and connect from anywhere.
 
-- MCP transport: Streamable HTTP at `/mcp` + legacy SSE at `/sse`
+- MCP transport: Streamable HTTP at `/mcp` (legacy SSE at `/sse` only with `ENABLE_LEGACY_SSE=1`)
 - REST API: `/api/*` endpoints for non-MCP clients (ChatGPT, scripts, etc.)
 - Database: PostgreSQL (via `DATABASE_URL`)
 - Auto-detected when `PORT` env var is set
@@ -75,6 +75,8 @@ Add to Claude Code MCP config (`~/.claude/settings.json` or project `.claude/set
    - `DATABASE_URL` — provided automatically by Railway PostgreSQL
    - `PORT` — provided automatically by Railway
    - `MCP_API_KEY` — your chosen bearer token for authentication
+   - Without `MCP_API_KEY` the server refuses to start (`ALLOW_NO_AUTH=1` is for local testing only); a key with a space or line break around it is refused too
+   - Optional: `SESSION_IDLE_DAYS` (default 1) and `MAX_SESSIONS` (default 200) bound open sessions; `ENABLE_LEGACY_SSE=1` turns the legacy `/sse` routes on; `CLEANUP_DAYS` (default 7)
 
 3. Connect from any client:
 
@@ -179,8 +181,8 @@ curl https://your-service.up.railway.app/api/messages/general \
 | `/api/search?q=` | GET | REST: Search messages |
 | `/api/data` | GET/POST | REST: List or store shared data |
 | `/api/data/:key` | GET | REST: Retrieve shared data |
-| `/sse` | GET | Legacy SSE transport |
-| `/messages` | POST | Legacy SSE message endpoint |
+| `/sse` | GET | Legacy SSE transport (only with `ENABLE_LEGACY_SSE=1`) |
+| `/messages` | POST | Legacy SSE message endpoint (only with `ENABLE_LEGACY_SSE=1`) |
 | `/health` | GET | Health check (no auth) |
 | `/openapi.json` | GET | OpenAPI spec for ChatGPT Actions (no auth) |
 

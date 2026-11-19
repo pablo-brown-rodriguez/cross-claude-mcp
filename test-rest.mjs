@@ -5,7 +5,7 @@
  * Starts the server in HTTP mode and tests all /api/* endpoints.
  */
 
-import { spawn, spawnSync } from "child_process";
+import { spawn } from "child_process";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { mkdtempSync, rmSync } from "fs";
@@ -13,15 +13,8 @@ import { tmpdir } from "os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = join(__dirname, "server.mjs");
-const PORT = 9876;
-
-// Kill any lingering process on our test port
-const lsof = spawnSync("lsof", ["-ti", `:${PORT}`], { encoding: "utf-8" });
-if (lsof.stdout.trim()) {
-  for (const pid of lsof.stdout.trim().split("\n")) {
-    spawnSync("kill", ["-9", pid]);
-  }
-}
+// A random high port: the suite used to kill -9 whatever was listening on a fixed one.
+const PORT = 44000 + Math.floor(Math.random() * 2000);
 
 // Use isolated temp directory for test DB
 const TEST_DB_DIR = mkdtempSync(join(tmpdir(), "cross-claude-test-"));
@@ -57,7 +50,8 @@ async function runTests() {
 
   const server = spawn("node", [SERVER_PATH], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, PORT: String(PORT), HOME: TEST_DB_DIR },
+    // Never the shell's database or key: with DATABASE_URL set this suite wrote to that database.
+    env: { ...process.env, PORT: String(PORT), HOME: TEST_DB_DIR, ALLOW_NO_AUTH: "1", DATABASE_URL: "", MCP_API_KEY: "" },
   });
 
   // Wait for server to start

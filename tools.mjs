@@ -34,15 +34,44 @@ function levenshteinClose(a, b) {
 export function registerTools(server, db, planChecker = null) {
   let currentInstanceId = null;
 
-  function touchHeartbeat() {
-    if (!currentInstanceId) return;
+  // After a server restart an open chat is answered by a one-request server (server.mjs) that
+  // has no memory of its register call. The caller's own id on the call (instance_id, sender)
+  // then keeps its presence alive; without it every open chat showed as offline while active.
+  function touchHeartbeat(fallbackId = null) {
+    const id = currentInstanceId || (typeof fallbackId === "string" && fallbackId ? fallbackId : null);
+    if (!id) return;
     // heartbeat() is async on PostgreSQL: a rejected promise is not caught by try/catch, and an
     // unhandled rejection ends the process (Node 15+). A missed heartbeat is harmless, so the
     // rejection is swallowed here; the tool call itself still reports its own database error.
-    try { Promise.resolve(db.heartbeat(currentInstanceId)).catch(() => {}); } catch { /* ignore */ }
+    try { Promise.resolve(db.heartbeat(id)).catch(() => {}); } catch { /* ignore */ }
   }
 
-  server.tool(
+  // A database or system error (it has a code, or a class of its own) can carry connection
+  // details in its message, and the SDK hands a thrown message to the caller. Those are answered
+  // by kind only; a plain Error keeps its message.
+  const tool = (...args) => {
+    const handler = args.pop();
+    const name = args[0];
+    return server.tool(...args, async (...callArgs) => {
+      try {
+        return await handler(...callArgs);
+      } catch (err) {
+        const coded = Boolean(err) && (typeof err.code === "string" || typeof err.code === "number");
+        if (!err || typeof err !== "object" || (!coded && err.name === "Error")) throw err;
+        const kind = `${typeof err.name === "string" ? err.name : "Error"}${coded ? ` ${err.code}` : ""}`.replace(/[^\w .:-]/g, "").slice(0, 80);
+        console.error(`[ERROR] tool ${name} | ${kind}`);
+        // A constraint failure (SQLite SQLITE_CONSTRAINT*, PostgreSQL class 23) is the caller's
+        // input, such as an in_reply_to id that does not exist: retrying cannot help.
+        const rejected = /^SQLITE_CONSTRAINT/.test(String(err.code)) || /^23[0-9A-Z]{3}$/.test(String(err.code));
+        const text = rejected
+          ? `Error: ${name} was rejected (${kind}): check the ids, names and values you sent; the same call will be rejected again.`
+          : `Error: ${name} could not be completed (${kind}). Try again shortly.`;
+        return { content: [{ type: "text", text }], isError: true };
+      }
+    });
+  };
+
+  tool(
     "register",
     "Register this Claude Code instance with an identity. Call this first before using other tools.",
     {
@@ -84,7 +113,7 @@ export function registerTools(server, db, planChecker = null) {
     }
   );
 
-  server.tool(
+  tool(
     "send_message",
     "Send a message to a channel for other instances to read. IMPORTANT: Before your first send in a session, call list_channels or find_channel to pick the right channel. Do NOT default to 'general' without checking — there is usually a more specific channel. If you move to a different channel mid-conversation, notify your collaborators in the old channel first.",
     {
@@ -123,7 +152,7 @@ export function registerTools(server, db, planChecker = null) {
       }
 
       await db.createChannel(normalized, null);
-      touchHeartbeat();
+      touchHeartbeat(sender);
       const id = await db.sendMessage(normalized, sender, content, message_type, in_reply_to || null);
       const nameNote = normalized !== channel ? ` (normalized from "${channel}")` : "";
       const doneHint = message_type === "response"
@@ -135,7 +164,7 @@ export function registerTools(server, db, planChecker = null) {
     }
   );
 
-  server.tool(
+  tool(
     "check_messages",
     "Check for new messages in a channel. Use after_id to only get messages newer than a specific message. If you're unsure which channel to check, call list_channels first.",
     {
@@ -146,7 +175,7 @@ export function registerTools(server, db, planChecker = null) {
     },
     async ({ channel, after_id, limit, instance_id }) => {
       const normalized = normalizeChannelName(channel);
-      touchHeartbeat();
+      touchHeartbeat(instance_id);
       let messages;
       if (instance_id && after_id !== undefined) {
         messages = await db.getUnread(normalized, after_id, instance_id);
@@ -172,7 +201,7 @@ export function registerTools(server, db, planChecker = null) {
     }
   );
 
-  server.tool(
+  tool(
     "wait_for_reply",
     "Poll a channel until a new message arrives from another instance, or until timeout. Stops early on 'done' messages.",
     {
@@ -182,12 +211,18 @@ export function registerTools(server, db, planChecker = null) {
       timeout_seconds: z.number().default(90).describe("Max seconds to wait (default: 90)"),
       poll_interval_seconds: z.number().default(5).describe("Seconds between polls (default: 5)"),
     },
-    async ({ channel, after_id, instance_id, timeout_seconds, poll_interval_seconds }) => {
+    async ({ channel, after_id, instance_id, timeout_seconds, poll_interval_seconds }, extra) => {
       const normalized = normalizeChannelName(channel);
-      const deadline = Date.now() + timeout_seconds * 1000;
+      // Bounded: an unbounded wait or interval kept polling the database long after the caller had gone.
+      const clamp = (value, low, high, fallback) => { const n = Number(value); return Number.isFinite(n) ? Math.min(Math.max(n, low), high) : fallback; };
+      const waitSeconds = clamp(timeout_seconds, 0, 600, 90);
+      const pollSeconds = clamp(poll_interval_seconds, 0.2, 60, 5);
+      const deadline = Date.now() + waitSeconds * 1000;
 
-      while (Date.now() < deadline) {
-        touchHeartbeat();
+      // Checked at least once: a timeout of 0 means "look once", not "do not look".
+      do {
+        if (extra && extra.signal && extra.signal.aborted) break;
+        touchHeartbeat(instance_id);
         const messages = await db.getUnread(normalized, after_id, instance_id);
 
         if (messages.length > 0) {
@@ -201,16 +236,16 @@ export function registerTools(server, db, planChecker = null) {
           };
         }
 
-        await new Promise((resolve) => setTimeout(resolve, poll_interval_seconds * 1000));
-      }
+        await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(pollSeconds * 1000, deadline - Date.now()))));
+      } while (Date.now() < deadline);
 
       return {
-        content: [{ type: "text", text: `No new messages in #${normalized} after waiting ${timeout_seconds}s. The other instance may be busy or offline. You can try again or check list_instances.` }],
+        content: [{ type: "text", text: `No new messages in #${normalized} after waiting ${waitSeconds}s. The other instance may be busy or offline. You can try again or check list_instances.` }],
       };
     }
   );
 
-  server.tool(
+  tool(
     "get_replies",
     "Get all replies to a specific message.",
     { message_id: z.number().describe("The message ID to get replies for") },
@@ -228,7 +263,7 @@ export function registerTools(server, db, planChecker = null) {
     }
   );
 
-  server.tool(
+  tool(
     "create_channel",
     "Create a named channel for organizing communication.",
     {
@@ -260,7 +295,7 @@ export function registerTools(server, db, planChecker = null) {
     }
   );
 
-  server.tool(
+  tool(
     "list_channels",
     "List all channels with activity stats (message count, last activity, participants). CALL THIS before your first send_message in any session to find the right channel.",
     {},
@@ -282,7 +317,7 @@ export function registerTools(server, db, planChecker = null) {
     }
   );
 
-  server.tool(
+  tool(
     "find_channel",
     "Search for channels by keyword. Matches against channel names and descriptions. Use this when you're not sure which channel to use.",
     {
@@ -309,7 +344,7 @@ export function registerTools(server, db, planChecker = null) {
     }
   );
 
-  server.tool("list_instances", "See all registered Claude Code instances.", {}, async () => {
+  tool("list_instances", "See all registered Claude Code instances.", {}, async () => {
     touchHeartbeat();
     await db.markStaleOffline(STALE_THRESHOLD_SECONDS);
     const instances = await db.listInstances();
@@ -320,7 +355,7 @@ export function registerTools(server, db, planChecker = null) {
     return { content: [{ type: "text", text: `Registered instances:\n${formatted}` }] };
   });
 
-  server.tool(
+  tool(
     "search_messages",
     "Search message content across all channels.",
     {
@@ -337,7 +372,7 @@ export function registerTools(server, db, planChecker = null) {
     }
   );
 
-  server.tool(
+  tool(
     "share_data",
     "Store large data (tables, plans, analysis) in a shared store instead of packing it into a message. Other instances can retrieve it by key. Use this for anything over ~500 chars.",
     {
@@ -351,7 +386,7 @@ export function registerTools(server, db, planChecker = null) {
         const check = await planChecker("share_data");
         if (!check.allowed) return { content: [{ type: "text", text: check.message }] };
       }
-      touchHeartbeat();
+      touchHeartbeat(sender);
       await db.shareData(key, content, sender, description || null);
       const sizeKb = (Buffer.byteLength(content) / 1024).toFixed(1);
       return {
@@ -360,7 +395,7 @@ export function registerTools(server, db, planChecker = null) {
     }
   );
 
-  server.tool(
+  tool(
     "get_shared_data",
     "Retrieve data that another instance shared via share_data.",
     {
@@ -376,7 +411,7 @@ export function registerTools(server, db, planChecker = null) {
     }
   );
 
-  server.tool(
+  tool(
     "list_shared_data",
     "List all shared data keys with their descriptions and sizes.",
     {},
@@ -393,9 +428,9 @@ export function registerTools(server, db, planChecker = null) {
   );
 
   // Return cleanup function for shutdown
+  // Returns a promise that never rejects, so a caller may await it (HTTP session close) or not.
   return () => {
-    if (currentInstanceId) {
-      db.markOffline(currentInstanceId);
-    }
+    if (!currentInstanceId) return Promise.resolve();
+    try { return Promise.resolve(db.markOffline(currentInstanceId)).catch(() => {}); } catch { return Promise.resolve(); }
   };
 }

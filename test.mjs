@@ -8,14 +8,16 @@
 import { spawn } from "child_process";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { unlinkSync, existsSync } from "fs";
-import { homedir } from "os";
+import { unlinkSync, existsSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = join(__dirname, "server.mjs");
 
-// Clean test database
-const DB_PATH = join(homedir(), ".cross-claude-mcp", "messages.db");
+// The test database lives in a throwaway HOME, so a run never touches (or deletes) the real
+// ~/.cross-claude-mcp/messages.db of the machine it runs on.
+const TEST_HOME = mkdtempSync(join(tmpdir(), "ccm-test-"));
+const DB_PATH = join(TEST_HOME, ".cross-claude-mcp", "messages.db");
 const DB_WAL = DB_PATH + "-wal";
 const DB_SHM = DB_PATH + "-shm";
 for (const f of [DB_PATH, DB_WAL, DB_SHM]) {
@@ -51,6 +53,8 @@ async function runTests() {
 
   const server = spawn("node", [SERVER_PATH], {
     stdio: ["pipe", "pipe", "pipe"],
+    // Never the shell's database or key: with DATABASE_URL set this suite wrote to that database.
+    env: { ...process.env, HOME: TEST_HOME, PORT: "", DATABASE_URL: "", MCP_API_KEY: "" },
   });
 
   let buffer = "";
@@ -382,6 +386,7 @@ async function runTests() {
     for (const f of [DB_PATH, DB_WAL, DB_SHM]) {
       if (existsSync(f)) unlinkSync(f);
     }
+    try { rmSync(TEST_HOME, { recursive: true, force: true }); } catch { /* leave it */ }
     process.exit(failed > 0 ? 1 : 0);
   }
 }
